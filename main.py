@@ -6,7 +6,7 @@ Conversational agent that recommends SHL Individual Test Solutions.
 import os
 import json
 import logging
-from typing import List
+from typing import List, Optional
 from contextlib import asynccontextmanager
 
 from fastapi import FastAPI, HTTPException
