@@ -4,7 +4,7 @@
 
 ### Architecture Overview
 
-The service is a **stateless FastAPI** application with two endpoints (`GET /health`, `POST /chat`). Each `/chat` call receives the full conversation history, performs catalog retrieval, and calls the Anthropic Claude API to generate a structured JSON response.
+The service is a **stateless FastAPI** application with two endpoints (`GET /health`, `POST /chat`). Each `/chat` call receives the full conversation history, performs catalog retrieval, and generates a structured JSON response using a free local recommendation engine.
 
 ```
 User → POST /chat (full history)
@@ -83,7 +83,7 @@ I tested against the 5 required behavior probes:
 | Component | Choice | Reason |
 |-----------|--------|--------|
 | API framework | FastAPI | Async, Pydantic validation, OpenAPI docs |
-| LLM | Claude claude-sonnet-4-20250514 | Best reasoning/speed balance, JSON output |
+| Recommendation engine | Local catalog retrieval + heuristics | Free, no external LLM dependency required |
 | Retrieval | Keyword BM25-style | No model loading, <5ms, sufficient for ~400 items |
-| Deployment | Render (free tier) | Simple, `render.yaml` config, ANTHROPIC_API_KEY env var |
+| Deployment | Render (free tier) | Simple, `render.yaml` config, no external API key required |
 | Catalog | Static + live scraper | Reliability first, freshness second |

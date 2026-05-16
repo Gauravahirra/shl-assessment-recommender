@@ -8,9 +8,6 @@ Conversational agent for recommending SHL Individual Test Solutions via dialogue
 # Install dependencies
 pip install -r requirements.txt
 
-# Set your Anthropic API key
-export ANTHROPIC_API_KEY=sk-ant-...
-
 # Run the server
 uvicorn main:app --host 0.0.0.0 --port 8000
 ```

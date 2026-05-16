@@ -6,14 +6,12 @@ Conversational agent that recommends SHL Individual Test Solutions.
 import os
 import json
 import logging
-from typing import List, Optional
+from typing import List
 from contextlib import asynccontextmanager
 
-import numpy as np
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
-import anthropic
 
 # ─── Models ───────────────────────────────────────────────────────────────────
 
@@ -199,7 +197,7 @@ Test type legend: A=Ability, B=Biodata/SJT, C=Competencies, D=Development/360, E
 
 
 def format_catalog_for_context(assessments: List[dict]) -> str:
-    """Format retrieved assessments as context for the LLM."""
+    """Format retrieved assessments as context for the agent."""
     lines = ["Relevant catalog items found:"]
     for item in assessments:
         types = ", ".join(item.get("test_types", []))
@@ -211,80 +209,100 @@ def format_catalog_for_context(assessments: List[dict]) -> str:
     return "\n".join(lines)
 
 
-def parse_agent_response(raw: str) -> dict:
-    """Parse JSON response from agent, with fallback handling."""
-    # Strip markdown fences if present
-    raw = raw.strip()
-    if raw.startswith("```"):
-        lines = raw.split("\n")
-        raw = "\n".join(lines[1:-1] if lines[-1] == "```" else lines[1:])
-    
-    try:
-        return json.loads(raw)
-    except json.JSONDecodeError:
-        # Attempt to extract JSON from mixed content
-        import re
-        match = re.search(r'\{.*\}', raw, re.DOTALL)
-        if match:
-            try:
-                return json.loads(match.group())
-            except:
-                pass
-        # Fallback: return raw as reply with empty recommendations
+def normalize_text(text: str) -> str:
+    return " ".join(text.lower().split())
+
+
+def extract_named_items(text: str) -> List[dict]:
+    lower = text.lower()
+    found = []
+    for item in CATALOG:
+        if item["name"].lower() in lower:
+            found.append(item)
+    return found
+
+
+def should_clarify(text: str) -> bool:
+    text = normalize_text(text)
+    vague_triggers = [
+        "i need an assessment",
+        "need an assessment",
+        "something for my team",
+        "something for my role",
+        "something for my company",
+        "i need tests",
+        "assessment",
+        "any assessment",
+    ]
+    explicit_terms = [
+        "developer", "engineer", "manager", "sales", "customer", "service", "stakeholder",
+        "java", "python", "sql", "cognitive", "personality", "behavior", "behaviour",
+        "personality", "opq", "ability", "reasoning", "simulation", "sjt", "manager",
+    ]
+    if any(text == trigger for trigger in vague_triggers if "assessment" not in trigger):
+        return True
+    if "assessment" in text and not any(term in text for term in explicit_terms):
+        return True
+    if len(text.split()) <= 4 and any(term in text for term in ["assessment", "tests", "test"]):
+        return True
+    return False
+
+
+def compare_assessments(query: str) -> Optional[str]:
+    if not any(keyword in query.lower() for keyword in ["difference between", "compare", "how is", "vs "]):
+        return None
+    items = extract_named_items(query)
+    if len(items) < 2:
+        return None
+    left, right = items[0], items[1]
+    left_type = ", ".join(left.get("test_types", []))
+    right_type = ", ".join(right.get("test_types", []))
+    left_desc = left.get("description", "No description available.")
+    right_desc = right.get("description", "No description available.")
+    return (
+        f"Here is a comparison between {left['name']} and {right['name']}:\n"
+        f"- {left['name']} is a {left_type} assessment. {left_desc}\n"
+        f"- {right['name']} is a {right_type} assessment. {right_desc}\n"
+        "Use the one that best matches the role and skills you need to assess."
+    )
+
+
+def build_response(messages: List[Message], retrieved: List[dict]) -> dict:
+    user_text = " ".join([m.content for m in messages if m.role == "user"]).strip()
+    compare_reply = compare_assessments(user_text)
+    if compare_reply:
+        return {"reply": compare_reply, "recommendations": [], "end_of_conversation": False}
+
+    if should_clarify(user_text):
         return {
-            "reply": raw,
+            "reply": "Can you share the role, seniority level, or skills you want to assess?",
             "recommendations": [],
-            "end_of_conversation": False
+            "end_of_conversation": False,
         }
 
+    # Strongly prefer personality if the user explicitly asks for it.
+    if "personality" in user_text or "opq" in user_text or "behavior" in user_text or "behaviour" in user_text:
+        retrieved = [item for item in retrieved if "P" in item.get("test_types", [])] or retrieved
+    if "coding" in user_text or "technical" in user_text or "programming" in user_text:
+        retrieved = [item for item in retrieved if "K" in item.get("test_types", []) or "S" in item.get("test_types", [])] or retrieved
 
-def build_recommendations(parsed: dict, retrieved: List[dict]) -> List[Recommendation]:
-    """
-    Build the final recommendations list.
-    Validate that all recommended items are in the catalog.
-    """
-    raw_recs = parsed.get("recommendations", [])
-    if not raw_recs:
-        return []
-    
-    # Build a URL+name lookup from catalog
-    catalog_by_url = {item["url"]: item for item in CATALOG}
-    catalog_by_name = {item["name"].lower(): item for item in CATALOG}
-    
-    validated = []
-    for rec in raw_recs:
-        name = rec.get("name", "")
-        url = rec.get("url", "")
-        test_type = rec.get("test_type", "")
-        
-        # Validate URL is from catalog
-        if url in catalog_by_url:
-            item = catalog_by_url[url]
-            validated.append(Recommendation(
-                name=item["name"],
-                url=item["url"],
-                test_type="".join(item.get("test_types", []))
-            ))
-        elif name.lower() in catalog_by_name:
-            # URL might be wrong but name matches - use catalog URL
-            item = catalog_by_name[name.lower()]
-            validated.append(Recommendation(
-                name=item["name"],
-                url=item["url"],
-                test_type="".join(item.get("test_types", []))
-            ))
-        else:
-            # Try fuzzy name match from retrieved items
-            for retrieved_item in retrieved:
-                if retrieved_item["name"].lower() == name.lower():
-                    validated.append(Recommendation(
-                        name=retrieved_item["name"],
-                        url=retrieved_item["url"],
-                        test_type="".join(retrieved_item.get("test_types", []))
-                    ))
-                    break
-    
-    return validated[:10]  # Hard cap at 10
+    if not retrieved:
+        return {
+            "reply": "I couldn't find matching SHL assessments with that description. Can you tell me more about the role or skills?",
+            "recommendations": [],
+            "end_of_conversation": False,
+        }
+
+    top_recs = retrieved[:10]
+    reply = f"Here are {len(top_recs)} SHL assessments that match the needs you described."
+    return {
+        "reply": reply,
+        "recommendations": [
+            Recommendation(name=item["name"], url=item["url"], test_type="".join(item.get("test_types", [])))
+            for item in top_recs
+        ],
+        "end_of_conversation": False,
+    }
 
 
 # ─── Lifespan & App ───────────────────────────────────────────────────────────
@@ -329,55 +347,15 @@ async def chat(request: ChatRequest):
         if msg.role not in ("user", "assistant"):
             raise HTTPException(status_code=400, detail=f"Invalid role: {msg.role}")
     
-    # Build query from recent user messages for retrieval
     user_messages = [m.content for m in request.messages if m.role == "user"]
-    combined_query = " ".join(user_messages[-3:])  # last 3 user turns
-    
-    # Retrieve relevant assessments
+    combined_query = " ".join(user_messages[-3:])
     retrieved = retrieve_assessments(combined_query, top_k=15)
-    catalog_context = format_catalog_for_context(retrieved)
-    
-    # Build messages for Claude API
-    claude_messages = []
-    for msg in request.messages:
-        claude_messages.append({
-            "role": msg.role,
-            "content": msg.content
-        })
-    
-    # Inject catalog context into last user message
-    if claude_messages and claude_messages[-1]["role"] == "user":
-        last_content = claude_messages[-1]["content"]
-        claude_messages[-1]["content"] = (
-            f"{last_content}\n\n"
-            f"[CATALOG RETRIEVAL - use these items for recommendations if relevant]\n"
-            f"{catalog_context}"
-        )
-    
-    # Call Anthropic API
-    client = anthropic.Anthropic(api_key=os.environ.get("ANTHROPIC_API_KEY", ""))
-    
-    try:
-        response = client.messages.create(
-            model="claude-sonnet-4-20250514",
-            max_tokens=1500,
-            system=SYSTEM_PROMPT,
-            messages=claude_messages,
-        )
-    except anthropic.APIError as e:
-        logger.error(f"Anthropic API error: {e}")
-        raise HTTPException(status_code=502, detail="LLM service error")
-    
-    raw_content = response.content[0].text
-    parsed = parse_agent_response(raw_content)
-    
-    # Validate and build final recommendations
-    recommendations = build_recommendations(parsed, retrieved)
-    
+    response = build_response(request.messages, retrieved)
+
     return ChatResponse(
-        reply=parsed.get("reply", raw_content),
-        recommendations=recommendations,
-        end_of_conversation=bool(parsed.get("end_of_conversation", False)),
+        reply=response["reply"],
+        recommendations=response["recommendations"],
+        end_of_conversation=response["end_of_conversation"],
     )
 
 
